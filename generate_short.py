@@ -126,3 +126,115 @@ def captions():
             response_format='verbose_json',
             timestamp_granularities=['segment']
         )
+    segments = getattr(transcript, 'segments', None) or []
+    if not segments:
+        raise ValueError('Transcription returned no timed segments')
+    header = '''[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,64,&H00FFFFFF,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,5,2,2,95,95,360,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+'''
+    with (OUT / 'subtitles.ass').open('w', encoding='utf-8') as output:
+        output.write(header)
+        for segment in segments:
+            if isinstance(segment, dict):
+                start, end, content = segment['start'], segment['end'], segment['text']
+            else:
+                start, end, content = segment.start, segment.end, segment.text
+            words = str(content).strip().split()
+            if not words or float(end) <= float(start):
+                continue
+            pos = float(start)
+            for index in range(0, len(words), 5):
+                chunk = words[index:index + 5]
+                finish = pos + (float(end) - float(start)) * len(chunk) / len(words)
+                safe = ' '.join(chunk).replace('\\', '').replace('{', '').replace('}', '')
+                output.write(f'Dialogue: 0,{ass_time(pos)},{ass_time(finish)},Default,,0,0,0,,{safe}\n')
+                pos = finish
+
+
+def images(prompts):
+    for index, prompt in enumerate(prompts, start=1):
+        print(f'Generating image {index}/5', flush=True)
+        result = CLIENT.images.generate(
+            model=IMAGE_MODEL, prompt=str(prompt),
+            size='1024x1536', quality='medium', n=1
+        )
+        encoded = result.data[0].b64_json
+        if not encoded:
+            raise ValueError('Image API did not return base64 data')
+        (OUT / f'scene_{index:02}.png').write_bytes(base64.b64decode(encoded))
+
+
+def render(audio_duration):
+    clip_length = audio_duration / 5
+    for index in range(1, 6):
+        command([
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+            '-loop', '1', '-framerate', str(FPS),
+            '-i', str(OUT / f'scene_{index:02}.png'),
+            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=25',
+            '-t', str(clip_length), '-an', '-c:v', 'libx264',
+            '-preset', 'veryfast', '-crf', '25', '-pix_fmt', 'yuv420p',
+            str(OUT / f'clip_{index:02}.mp4')
+        ])
+    with (OUT / 'clips.txt').open('w', encoding='utf-8') as listing:
+        for index in range(1, 6):
+            listing.write(f"file 'clip_{index:02}.mp4'\n")
+    command([
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'concat', '-safe', '0', '-i', str(OUT / 'clips.txt'),
+        '-c', 'copy', str(OUT / 'joined.mp4')
+    ])
+    command([
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+        '-i', str(OUT / 'joined.mp4'), '-i', str(OUT / 'voice.mp3'),
+        '-vf', 'ass=output/subtitles.ass', '-map', '0:v:0', '-map', '1:a:0',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25',
+        '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k',
+        '-t', str(audio_duration), '-movflags', '+faststart',
+        str(OUT / 'short.mp4')
+    ])
+
+
+def main():
+    fact, history = choose_fact()
+    print('Selected topic:', fact['topic'], flush=True)
+    story = create_story(fact)
+    for attempt in range(4):
+        audio_duration = make_voice(story['script'])
+        print(f'Voice duration: {audio_duration:.1f}s', flush=True)
+        if 30 <= audio_duration <= 45:
+            break
+        if attempt == 3:
+            raise ValueError('Could not obtain 30-45 second voiceover')
+        adjustment = 'Make narration shorter by 15%.' if audio_duration > 45 else 'Make narration longer by 15%.'
+        story = create_story(fact, adjustment, story['script'])
+    (OUT / 'script.txt').write_text(story['script'], encoding='utf-8')
+    (OUT / 'fact_check.json').write_text(json.dumps(fact, indent=2, ensure_ascii=False), encoding='utf-8')
+    hashtags = ' '.join(str(tag) for tag in story['hashtags'][:5])
+    metadata = {
+        'title': story['title'][:95],
+        'description': f"{story['description']}\n\n{hashtags}\n\nSource: {fact['source']}"
+    }
+    (OUT / 'youtube_metadata.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding='utf-8')
+    captions()
+    images(story['visual_prompts'])
+    render(audio_duration)
+    if not (OUT / 'short.mp4').is_file() or (OUT / 'short.mp4').stat().st_size == 0:
+        raise RuntimeError('Video missing after rendering')
+    history.append(fact['id'])
+    HISTORY.write_text(json.dumps(history, indent=2), encoding='utf-8')
+    print('FACTSHOCK AI VIDEO READY', flush=True)
+
+
+if __name__ == '__main__':
+    main()
