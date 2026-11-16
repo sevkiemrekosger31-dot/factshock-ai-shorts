@@ -343,7 +343,7 @@ def generate_images(script):
 
         result = openai.images.generate(
             model=IMAGE_MODEL,
-            prompt=prompt,
+            prompt=str(prompt) if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False),
             size="1024x1536",
             quality="medium",
             n=1
