@@ -33,19 +33,22 @@ FACTS = [
 ]
 
 
+
 def run(args):
     subprocess.run(args, check=True)
 
 
 def duration(path):
-    return float(subprocess.check_output(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',str(path)], text=True).strip())
+    return float(subprocess.check_output([
+        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1', str(path)
+    ], text=True).strip())
 
 
-def json_from_model(text):
-    text = text.strip()
-    text = re.sub(r'^```(?:json)?\s*', '', text)
-    text = re.sub(r'\s*```$', '', text)
-    return json.loads(text)
+def json_from_model(value):
+    value = re.sub(r'^```(?:json)?\s*', '', value.strip())
+    value = re.sub(r'\s*```$', '', value)
+    return json.loads(value)
 
 
 def choose_fact():
@@ -53,76 +56,73 @@ def choose_fact():
         history = json.loads(HISTORY.read_text(encoding='utf-8')) if HISTORY.exists() else []
         if not isinstance(history, list):
             history = []
-    except (json.JSONDecodeError, OSError):
+    except (OSError, json.JSONDecodeError):
         history = []
-    remaining = [x for x in FACTS if x['id'] not in history]
+    remaining = [fact for fact in FACTS if fact['id'] not in history]
     if not remaining:
         history = []
         remaining = FACTS[:]
     return random.choice(remaining), history
 
 
-def write_story(client, fact, target='normal', previous=''):
+def write_story(client, fact, direction='normal', previous=''):
+    directions = {
+        'normal': 'Write a fresh script of approximately 85-100 spoken words.',
+        'shorter': 'Rewrite the previous script approximately 15 percent shorter.',
+        'longer': 'Rewrite the previous script approximately 15 percent longer.'
+    }
     instructions = (
-        'You write compelling, factual American-English YouTube Shorts voiceovers. '
-        'Return ONLY valid JSON with keys script, title, description, hashtags, visual_prompts. '
-        'script: approximately 85-100 spoken words, no stage directions, one main idea, '
-        'an immediately gripping opening, a surprising middle, and a short natural question at the end. '
-        'Do not repeat generic intros like "Did you know". Never add factual claims, dates, '
-        'numbers, analogies or quotes beyond the supplied fact notes. '
-        'title: accurate and under 65 characters. description: two concise sentences. '
-        'hashtags: array of 3-5 strings starting with #. '
-        'visual_prompts: exactly five DIFFERENT detailed photorealistic cinematic vertical 9:16 '
-        'image prompts, as plain strings, depicting the story in order; no text or logos; '
-        'avoid misleading scientific details. '
-        'Use engaging writing, but no sensationalized misinformation.'
+        'Create a compelling factual American-English YouTube Short. '
+        'Return ONLY a JSON object with keys: script, title, description, hashtags, visual_prompts. '
+        'Use one central fact. Begin with a specific, surprising hook in the first sentence. '
+        'Avoid generic textbook introductions. Finish with a brief natural question. '
+        'Do not invent facts, comparisons, numerical claims, dates or quotations. '
+        'Only use the supplied factual notes. No stage directions in the script. '
+        'Title under 65 characters. Description two concise sentences. '
+        'Hashtags must be an array of 3-5 strings starting with #. '
+        'visual_prompts must be exactly five detailed, different, plain STRING prompts '
+        'for photorealistic 9:16 documentary-style still images in narrative order. '
+        'No lettering, watermarks or logos in images. Avoid misleading visuals.'
     )
-    instruction = {'normal':'Write a fresh version.', 'shorter':'Make the narration 12 percent shorter than the previous version.', 'longer':'Make the narration 12 percent longer than the previous version.'}[target]
-    result = client.responses.create(
+    response = client.responses.create(
         model=os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'),
         instructions=instructions,
-        input=f"TOPIC: {fact['topic']}\nFACT NOTES: {fact['fact']}\n{instruction}\nPREVIOUS: {previous}"
+        input=(f"TOPIC: {fact['topic']}\nFACT NOTES: {fact['fact']}\n"
+               f"TASK: {directions[direction]}\nPREVIOUS: {previous}")
     )
-    data = json_from_model(result.output_text)
+    data = json_from_model(response.output_text)
     if not isinstance(data, dict) or not isinstance(data.get('script'), str):
-        raise ValueError('Invalid story structure')
+        raise ValueError('Story JSON must include a script string')
     prompts = data.get('visual_prompts')
-    if not isinstance(prompts, list) or len(prompts) != 5 or any(not isinstance(p, str) or not p.strip() for p in prompts):
-        raise ValueError('visual_prompts must contain five nonempty strings')
+    if not isinstance(prompts, list) or len(prompts) != 5 or any(
+        not isinstance(prompt, str) or not prompt.strip() for prompt in prompts
+    ):
+        raise ValueError('visual_prompts must be exactly five nonempty strings')
+    if not isinstance(data.get('hashtags'), list):
+        raise ValueError('hashtags must be a list')
     return data
 
 
-def tts(client, script):
+def make_voice(client, script):
     path = OUT / 'voice.mp3'
     with client.audio.speech.with_streaming_response.create(
-        model=os.getenv('TTS_MODEL', 'tts-1'), voice='onyx', input=script, speed=1.05
+        model=os.getenv('TTS_MODEL', 'tts-1'),
+        voice='onyx', input=script, speed=1.05
     ) as response:
         response.stream_to_file(path)
     return duration(path)
 
 
 def ass_timestamp(seconds):
-    centiseconds = max(0, round(float(seconds) * 100))
-    hours, remainder = divmod(centiseconds, 360000)
-    minutes, remainder = divmod(remainder, 6000)
-    secs, cs = divmod(remainder, 100)
-    return f'{hours}:{minutes:02}:{secs:02}.{cs:02}'
+    cs = max(0, round(float(seconds) * 100))
+    h, rem = divmod(cs, 360000)
+    m, rem = divmod(rem, 6000)
+    s, c = divmod(rem, 100)
+    return f'{h}:{m:02}:{s:02}.{c:02}'
 
 
-def write_captions(client, audio_seconds):
+def write_captions(client):
     with (OUT / 'voice.mp3').open('rb') as audio:
         transcript = client.audio.transcriptions.create(
             model='whisper-1', file=audio, response_format='verbose_json',
             timestamp_granularities=['segment']
-        )
-    segments = getattr(transcript, 'segments', None) or []
-    if not segments:
-        raise ValueError('No timed subtitle segments returned')
-    header = '''[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-WrapStyle: 2
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
