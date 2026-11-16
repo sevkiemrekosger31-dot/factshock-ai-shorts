@@ -4,10 +4,8 @@ name: FactShock AI - 2 Daily Shorts
 on:
   workflow_dispatch:
   schedule:
-    # 15:00 and 23:00 UTC every day
-    # Turkey: 18:00 and 02:00
-    - cron: '0 15,23 * * *'
-
+    - cron: '0 15 * * *'
+    - cron: '0 23 * * *'
 permissions:
   contents: write
 
