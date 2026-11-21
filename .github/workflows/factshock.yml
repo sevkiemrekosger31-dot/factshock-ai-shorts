@@ -21,8 +21,7 @@ concurrency:
 
 jobs:
   create-and-upload:
-    # Keep schedules OFF until preview is approved and repo variable is set to true.
-    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_AUTO_PUBLISH == 'true'
+    # Scheduled uploads are ON; manual runs default to preview only.
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -62,7 +61,8 @@ jobs:
           test -s output/script.txt
           test -s output/youtube_metadata.json
           test -s output/fact_check.json
-          test -s fact_history.json
+          test -s output/next_fact_history.json
+          test -s output/quality_report.json
           python - <<'PY'
           import json, subprocess
           from pathlib import Path
@@ -70,6 +70,8 @@ jobs:
           assert 45 <= d <= 55, f'Bad duration: {d:.2f}s'
           m=json.loads(Path('output/youtube_metadata.json').read_text())
           assert m['title'] and m['description']
+          q=json.loads(Path('output/quality_report.json').read_text())
+          assert q['passed'] and q['audio_present']
           print(f'Validated: {d:.2f}s')
           PY
 
@@ -83,6 +85,8 @@ jobs:
             output/youtube_metadata.json
             output/fact_check.json
             output/subtitles.ass
+            output/caption_qc.json
+            output/quality_report.json
           retention-days: 7
 
       - name: Upload to YouTube
@@ -94,18 +98,48 @@ jobs:
           YOUTUBE_PRIVACY: public
         run: python upload_youtube.py
 
-      - name: Save topic history
+      - name: Save topic history after successful upload
         if: github.event_name == 'schedule' || inputs.publish == true
+        shell: bash
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add fact_history.json
-          if ! git diff --cached --quiet; then
-            git commit -m 'Update FactShock topic history'
-            git pull --rebase origin main
-            git push origin HEAD:main
-          fi
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+            python - <<'PYHISTORY'
+          import json
+          from pathlib import Path
+          path=Path('fact_history.json')
+          previous=json.loads(path.read_text()) if path.exists() else []
+          if isinstance(previous,dict):
+              previous=previous.get('used_topics',previous.get('history',previous.get('used',[])))
+          if not isinstance(previous,list):
+              raise RuntimeError('Unknown history schema; refusing overwrite')
+          pending=json.loads(Path('output/next_fact_history.json').read_text())
+          if not isinstance(pending,list) or not pending:
+              raise RuntimeError('Missing new topic')
+          current_id=pending[-1]
+          previous=[str(x.get('id',x.get('topic',''))) if isinstance(x,dict) else str(x) for x in previous]
+          previous.append(current_id)
+          path.write_text(json.dumps(previous[-200:],ensure_ascii=False,indent=2)+'\n')
+          PYHISTORY
+            git add fact_history.json
+            if git diff --cached --quiet; then
+              echo 'No history changes needed'
+              exit 0
+            fi
+            git commit -m 'Record published FactShock topic'
+            if git push origin HEAD:main; then
+              echo 'Published topic saved'
+              exit 0
+            fi
+            echo "History push attempt $attempt failed; retrying"
+            sleep $((attempt * 3))
+          done
+          echo 'WARNING: YouTube upload succeeded but history could not be saved.' >&2
+          exit 1
 
       - name: Complete
         run: echo 'FactShock run completed. Check preview artifact and upload step.'
