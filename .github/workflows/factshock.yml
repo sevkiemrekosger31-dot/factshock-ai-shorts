@@ -3,9 +3,16 @@ name: FactShock AI - 2 Daily Shorts
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish video publicly?"
+        required: true
+        type: boolean
+        default: false
   schedule:
     - cron: '0 15 * * *'
     - cron: '0 23 * * *'
+
 permissions:
   contents: write
 
@@ -47,23 +54,36 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python generate_short.py
 
-      - name: Validate generated video
+      - name: Validate generated files and duration
+        shell: bash
         run: |
+          set -euo pipefail
+
           test -s output/short.mp4
           test -s output/script.txt
           test -s output/youtube_metadata.json
           test -s output/fact_check.json
           test -s fact_history.json
-          ffprobe -v error \
+
+          duration=$(ffprobe -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 \
-            output/short.mp4
-          ls -lh output/short.mp4
+            output/short.mp4)
 
-      - name: Save generated video
+          python - "$duration" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          if not 45 <= duration <= 55:
+              raise SystemExit(
+                  f"Invalid duration: {duration:.2f}s"
+              )
+          print(f"Duration OK: {duration:.2f}s")
+          PY
+
+      - name: Save preview artifact
         uses: actions/upload-artifact@v4
         with:
-          name: factshock-short-${{ github.run_id }}
+          name: factshock-preview-${{ github.run_id }}
           path: |
             output/short.mp4
             output/script.txt
@@ -72,6 +92,9 @@ jobs:
           retention-days: 7
 
       - name: Upload video to YouTube
+        if: >-
+          github.event_name == 'schedule' ||
+          inputs.publish == true
         env:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
@@ -80,7 +103,13 @@ jobs:
         run: python upload_youtube.py
 
       - name: Save completed topic history
+        if: >-
+          github.event_name == 'schedule' ||
+          inputs.publish == true
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -92,8 +121,7 @@ jobs:
             git push origin HEAD:main
           fi
 
-      - name: Print success message
+      - name: Print success
         run: |
-          echo "FACTSHOCK AI VIDEO COMPLETED"
-          echo "Video uploaded privately to YouTube"
-          echo "Topic history saved"
+          echo "FACTSHOCK AI WORKFLOW COMPLETED"
+          echo "Preview artifact available"
