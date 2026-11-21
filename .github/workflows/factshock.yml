@@ -1,11 +1,10 @@
-
 name: FactShock AI - 2 Daily Shorts
 
 on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish video publicly?"
+        description: 'Publish this video to YouTube?'
         required: true
         type: boolean
         default: false
@@ -22,15 +21,16 @@ concurrency:
 
 jobs:
   create-and-upload:
+    # Keep schedules OFF until preview is approved and repo variable is set to true.
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_AUTO_PUBLISH == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
           ref: main
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -45,42 +45,35 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install anthropic openai
-          python -m pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          python -m pip install 'openai>=1.75,<3' google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
 
-      - name: Generate FactShock video
+      - name: Generate video
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4.1-mini
+          IMAGE_MODEL: gpt-image-1-mini
+          TTS_MODEL: gpt-4o-mini-tts
         run: python generate_short.py
 
-      - name: Validate generated files and duration
-        shell: bash
+      - name: Validate video and metadata
         run: |
           set -euo pipefail
-
           test -s output/short.mp4
           test -s output/script.txt
           test -s output/youtube_metadata.json
           test -s output/fact_check.json
           test -s fact_history.json
-
-          duration=$(ffprobe -v error \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 \
-            output/short.mp4)
-
-          python - "$duration" <<'PY'
-          import sys
-          duration = float(sys.argv[1])
-          if not 45 <= duration <= 55:
-              raise SystemExit(
-                  f"Invalid duration: {duration:.2f}s"
-              )
-          print(f"Duration OK: {duration:.2f}s")
+          python - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          d=float(subprocess.check_output(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1','output/short.mp4'],text=True))
+          assert 45 <= d <= 55, f'Bad duration: {d:.2f}s'
+          m=json.loads(Path('output/youtube_metadata.json').read_text())
+          assert m['title'] and m['description']
+          print(f'Validated: {d:.2f}s')
           PY
 
-      - name: Save preview artifact
+      - name: Save preview
         uses: actions/upload-artifact@v4
         with:
           name: factshock-preview-${{ github.run_id }}
@@ -89,12 +82,11 @@ jobs:
             output/script.txt
             output/youtube_metadata.json
             output/fact_check.json
+            output/subtitles.ass
           retention-days: 7
 
-      - name: Upload video to YouTube
-        if: >-
-          github.event_name == 'schedule' ||
-          inputs.publish == true
+      - name: Upload to YouTube
+        if: github.event_name == 'schedule' || inputs.publish == true
         env:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
@@ -102,26 +94,18 @@ jobs:
           YOUTUBE_PRIVACY: public
         run: python upload_youtube.py
 
-      - name: Save completed topic history
-        if: >-
-          github.event_name == 'schedule' ||
-          inputs.publish == true
-        shell: bash
+      - name: Save topic history
+        if: github.event_name == 'schedule' || inputs.publish == true
         run: |
           set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add fact_history.json
-
           if ! git diff --cached --quiet; then
-            git commit -m "Update FactShock topic history"
+            git commit -m 'Update FactShock topic history'
             git pull --rebase origin main
             git push origin HEAD:main
           fi
 
-      - name: Print success
-        run: |
-          echo "FACTSHOCK AI WORKFLOW COMPLETED"
-          echo "Preview artifact available"
+      - name: Complete
+        run: echo 'FactShock run completed. Check preview artifact and upload step.'
